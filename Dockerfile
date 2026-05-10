@@ -15,7 +15,10 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
-ENV PORT=8000
+RUN mkdir -p /app/data /tmp/nova_bot_proxies
+
+ENV PORT=8000 \
+    DATA_DIR=/app/data
 EXPOSE 8000
 
 CMD ["python", "main.py"]
