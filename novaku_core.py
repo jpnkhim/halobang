@@ -769,3 +769,4 @@ def rows_to_csv_bytes(rows) -> bytes:
     for r in rows:
         writer.writerow([r.get(k, "") for k in CSV_HEADER])
     return buf.getvalue().encode("utf-8")
+  
