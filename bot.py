@@ -8,15 +8,19 @@ Features
   retries, max-proxy-swaps, reset)
 - Upload proxies.txt -> auto-renamed and stored per user
 - Start registration with live progress message + Cancel button
-- Cancel saves accumulated accounts to CSV automatically
-- Download CSV button
-- Total accounts counter
-- All in-memory (Koyeb free tier ephemeral filesystem friendly)
+- Each successful account is appended to a per-user CSV on disk in real time
+  (`/app/data/accounts_<user_id>.csv`) so it survives container crashes during
+  the run. CSV is also auto-sent to the chat on completion / cancellation.
+- Cancel saves accumulated accounts (auto, since they are already on disk).
+- Download CSV button serves the on-disk file.
+- Total accounts counter reflects on-disk count.
+- Clear button to reset accumulated CSV.
 """
 
 from __future__ import annotations
 
 import asyncio
+import csv as csv_mod
 import io
 import logging
 import os
@@ -39,9 +43,9 @@ from telegram.ext import (
 )
 
 from novaku_core import (
+    CSV_HEADER,
     DEFAULT_SETTINGS,
     MAX_THREADS,
-    rows_to_csv_bytes,
     run_registration,
 )
 
@@ -49,19 +53,60 @@ from novaku_core import (
 log = logging.getLogger("bot")
 
 PROXY_DIR = "/tmp/nova_bot_proxies"
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 os.makedirs(PROXY_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# CSV persistence helpers
+# ---------------------------------------------------------------------------
+def csv_path_for(user_id: int) -> str:
+    return os.path.join(DATA_DIR, f"accounts_{user_id}.csv")
+
+
+def append_row_to_csv(path: str, row: dict, lock: threading.Lock) -> None:
+    """Thread-safe append a single account row to the per-user CSV file."""
+    with lock:
+        is_new = (not os.path.exists(path)) or os.path.getsize(path) == 0
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv_mod.writer(f)
+            if is_new:
+                writer.writerow(CSV_HEADER)
+            writer.writerow([row.get(k, "") for k in CSV_HEADER])
+
+
+def load_rows_from_csv(path: str) -> list[dict]:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            return list(csv_mod.DictReader(f))
+    except Exception:
+        return []
+
+
+def count_rows_on_disk(path: str) -> int:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            n = sum(1 for _ in f)
+        return max(0, n - 1)  # minus header
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
 # Per-user state
 # ---------------------------------------------------------------------------
-def _get_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    """Per-user state stored in context.user_data."""
+def _get_state(context: ContextTypes.DEFAULT_TYPE, user_id: int | None = None) -> dict:
+    """Per-user state stored in context.user_data. Lazily loads CSV from disk."""
     ud = context.user_data
     if "settings" not in ud:
         ud["settings"] = dict(DEFAULT_SETTINGS)
     if "accounts" not in ud:
-        ud["accounts"] = []        # list of row dicts
+        ud["accounts"] = []        # list of row dicts (mirror of on-disk CSV)
     if "is_running" not in ud:
         ud["is_running"] = False
     if "cancel_event" not in ud:
@@ -69,9 +114,17 @@ def _get_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
     if "proxy_path" not in ud:
         ud["proxy_path"] = None
     if "awaiting" not in ud:
-        ud["awaiting"] = None      # name of the setting awaiting a text reply
+        ud["awaiting"] = None
     if "progress_message_id" not in ud:
         ud["progress_message_id"] = None
+    if "csv_lock" not in ud:
+        ud["csv_lock"] = threading.Lock()
+    if "csv_path" not in ud and user_id is not None:
+        ud["csv_path"] = csv_path_for(user_id)
+        # First-time load: hydrate accounts list from the on-disk CSV so the
+        # counter / download remain consistent across bot restarts (within
+        # the same Koyeb instance lifetime).
+        ud["accounts"] = load_rows_from_csv(ud["csv_path"])
     return ud
 
 
@@ -86,7 +139,10 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Total Akun", callback_data="total"),
             InlineKeyboardButton("📥 Download CSV", callback_data="download"),
         ],
-        [InlineKeyboardButton("📤 Upload Proxies", callback_data="upload_proxies")],
+        [
+            InlineKeyboardButton("📤 Upload Proxies", callback_data="upload_proxies"),
+            InlineKeyboardButton("🗑️ Hapus CSV", callback_data="clear_csv"),
+        ],
         [InlineKeyboardButton("❓ Bantuan", callback_data="help")],
     ])
 
@@ -153,12 +209,12 @@ async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Command handlers
 # ---------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _get_state(context)
+    _get_state(context, update.effective_user.id)
     await send_main_menu(update, context)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _get_state(context)
+    _get_state(context, update.effective_user.id)
     await send_main_menu(update, context)
 
 
@@ -172,7 +228,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    state = _get_state(context)
+    state = _get_state(context, update.effective_user.id)
     data = query.data
 
     if data == "main_menu":
@@ -184,28 +240,54 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "total":
-        n = len(state["accounts"])
+        n_disk = count_rows_on_disk(state.get("csv_path", ""))
+        n_mem = len(state["accounts"])
         await query.message.reply_text(
-            f"📊 *Total akun terkumpul:* `{n}`",
+            f"📊 *Total akun terkumpul:* `{n_mem}`\n"
+            f"_Tersimpan di disk:_ `{n_disk}` baris\n"
+            f"_File:_ `{os.path.basename(state.get('csv_path','-'))}`",
             parse_mode="Markdown",
             reply_markup=back_kb(),
         )
         return
 
     if data == "download":
-        rows = state["accounts"]
-        if not rows:
+        path = state.get("csv_path")
+        if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
             await query.message.reply_text(
                 "Belum ada akun terkumpul. Jalankan registrasi dulu.",
                 reply_markup=back_kb(),
             )
             return
-        csv_bytes = rows_to_csv_bytes(rows)
-        bio = io.BytesIO(csv_bytes)
+        with state["csv_lock"]:
+            with open(path, "rb") as f:
+                data_bytes = f.read()
+        bio = io.BytesIO(data_bytes)
         bio.name = f"accounts_{int(time.time())}.csv"
         await query.message.reply_document(
             document=InputFile(bio, filename=bio.name),
-            caption=f"📥 {len(rows)} akun",
+            caption=f"📥 {len(state['accounts'])} akun (auto-saved on disk)",
+        )
+        return
+
+    if data == "clear_csv":
+        if state["is_running"]:
+            await query.message.reply_text(
+                "⏳ Tidak bisa menghapus saat proses berjalan.",
+                reply_markup=back_kb(),
+            )
+            return
+        path = state.get("csv_path")
+        with state["csv_lock"]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            state["accounts"] = []
+        await query.message.reply_text(
+            "🗑️ CSV dan daftar akun di memori sudah dihapus.",
+            reply_markup=back_kb(),
         )
         return
 
@@ -287,7 +369,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Free-text handler (settings input + ignore)
 # ---------------------------------------------------------------------------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = _get_state(context)
+    state = _get_state(context, update.effective_user.id)
     awaiting = state.get("awaiting")
     if not awaiting:
         await update.message.reply_text(
@@ -338,7 +420,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Document upload (proxies.txt)
 # ---------------------------------------------------------------------------
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = _get_state(context)
+    state = _get_state(context, update.effective_user.id)
     if state.get("awaiting") != "proxies_upload":
         # Allow upload anytime if user is not in a different awaiting state
         if state.get("awaiting"):
@@ -382,7 +464,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Registration runner
 # ---------------------------------------------------------------------------
 async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = _get_state(context)
+    state = _get_state(context, update.effective_user.id)
     chat_id = update.effective_chat.id
 
     if state["is_running"]:
@@ -442,8 +524,16 @@ async def _run_registration_task(
     loop = asyncio.get_running_loop()
     accounts_lock = threading.Lock()
     started_count = len(state["accounts"])
+    csv_path = state["csv_path"]
+    csv_lock = state["csv_lock"]
 
     def on_account(row: dict):
+        # 1) auto-save to disk first (durable across worker crash within instance)
+        try:
+            append_row_to_csv(csv_path, row, csv_lock)
+        except Exception as e:
+            log.warning(f"failed to append row to csv: {e}")
+        # 2) mirror in memory for live counters
         with accounts_lock:
             state["accounts"].append(row)
 
@@ -468,7 +558,8 @@ async def _run_registration_task(
             f"Target: `{settings_snapshot['count']}`  "
             f"Threads: `{settings_snapshot['threads']}`\n"
             f"Berhasil sesi ini: `{done}/{settings_snapshot['count']}`\n"
-            f"Total akun di memori: `{len(state['accounts'])}`\n\n"
+            f"Total akun di CSV: `{len(state['accounts'])}`\n"
+            f"💾 _Setiap akun langsung di-save ke disk._\n\n"
             f"_Anda tetap bisa pakai menu lain selama proses berjalan._"
         )
         if cancel_event.is_set():
@@ -499,7 +590,8 @@ async def _run_registration_task(
     summary = (
         f"{'⛔ *Dibatalkan*' if cancelled else '✅ *Selesai*'}\n"
         f"Berhasil sesi ini: `{success_run}/{total_run}`\n"
-        f"Total akun di memori: `{len(state['accounts'])}`"
+        f"Total akun di CSV: `{len(state['accounts'])}`\n"
+        f"💾 File: `{os.path.basename(csv_path)}`"
     )
     if err:
         summary += f"\n⚠️ Error: `{err}`"
@@ -513,16 +605,19 @@ async def _run_registration_task(
     except Exception:
         await context.bot.send_message(chat_id, summary, parse_mode="Markdown")
 
-    if state["accounts"]:
-        csv_bytes = rows_to_csv_bytes(state["accounts"])
-        bio = io.BytesIO(csv_bytes)
+    # Auto-send CSV from disk
+    if state["accounts"] and os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+        with csv_lock:
+            with open(csv_path, "rb") as f:
+                data_bytes = f.read()
+        bio = io.BytesIO(data_bytes)
         bio.name = f"accounts_{int(time.time())}.csv"
         try:
             await context.bot.send_document(
                 chat_id=chat_id,
                 document=InputFile(bio, filename=bio.name),
                 caption=("⛔ Auto-save (cancel): " if cancelled else "📥 ")
-                        + f"{len(state['accounts'])} akun",
+                        + f"{len(state['accounts'])} akun (saved on disk)",
                 reply_markup=main_menu_kb(),
             )
         except Exception as e:
@@ -550,4 +645,3 @@ def build_application(token: str) -> Application:
     application.add_handler(MessageHandler(filters.Document.ALL, on_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return application
-  
