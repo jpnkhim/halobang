@@ -1,5 +1,6 @@
 import os
 import threading
+import asyncio
 from flask import Flask
 
 from bot import main
@@ -11,6 +12,8 @@ def home():
     return "NovaEX Bot Running"
 
 def run_bot():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     main()
 
 threading.Thread(target=run_bot).start()
