@@ -1,25 +1,58 @@
 import os
-from telegram.ext import Application, CommandHandler
+import threading
+from flask import Flask, jsonify
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+app = Flask(__name__)
 
-async def start(update, context):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Unauthorized")
-        return
+runtime_data = {
+    "status": "running",
+    "message": "NovaEX Bot Active"
+}
 
-    await update.message.reply_text(
-        "✅ NovaEX Telegram Bot Running on Koyeb"
+
+@app.route("/")
+def home():
+    return jsonify({
+        "app": "NovaEX Telegram Bot",
+        "status": runtime_data["status"],
+        "message": runtime_data["message"]
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "healthy"
+    })
+
+
+@app.route("/runtime")
+def runtime():
+    return jsonify(runtime_data)
+
+
+def run_web():
+    port = int(os.getenv("PORT", 8000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
     )
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+# Jalankan Flask di background
+threading.Thread(
+    target=run_web,
+    daemon=True
+).start()
 
-    print("Bot running...")
-    app.run_polling()
 
-if __name__ == "__main__":
-    main()
+# Jalankan bot Telegram di main thread
+from bot import main
+
+print("🚀 Runtime Active")
+print("🤖 Telegram Bot Running")
+
+main()
