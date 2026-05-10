@@ -550,3 +550,4 @@ def build_application(token: str) -> Application:
     application.add_handler(MessageHandler(filters.Document.ALL, on_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return application
+  
