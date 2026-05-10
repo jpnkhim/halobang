@@ -268,7 +268,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ev: threading.Event | None = state.get("cancel_event")
         if ev and not ev.is_set():
             ev.set()
-            await query.message.reply_text("⛔ Cancel diminta — menunggu worker selesai...")
+            try:
+                await query.edit_message_text(
+                    "⛔ *Cancel diminta* — worker akan berhenti setelah akun "
+                    "yang sedang berjalan selesai. CSV akan dikirim otomatis.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                await query.message.reply_text(
+                    "⛔ Cancel diminta — menunggu worker selesai..."
+                )
         else:
             await query.message.reply_text("Tidak ada proses yang sedang berjalan.")
         return
@@ -394,31 +403,50 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
     state["cancel_event"] = cancel_event
     state["is_running"] = True
 
-    # Kirim progress message awal
     msg = await context.bot.send_message(
         chat_id,
         f"🚀 *Mulai registrasi*\n"
         f"Target: `{s['count']}`  Threads: `{s['threads']}`\n"
         f"Invite: `{s['invite']}` ({s['invite_mode']})  GA: "
         f"`{'skip' if s['no_ga'] else 'on'}`\n\n"
-        f"Progress: 0/{s['count']}",
+        f"Progress: 0/{s['count']}\n\n"
+        f"_Anda tetap bisa pakai menu lain selama proses berjalan._",
         parse_mode="Markdown",
         reply_markup=cancel_kb(),
     )
     state["progress_message_id"] = msg.message_id
 
+    settings_snapshot = dict(s)
+    proxy_path = state["proxy_path"]
+    pre_invites = [r.get("user_code", "") for r in state["accounts"] if r.get("user_code")]
+
+    # Fire-and-forget so this handler returns immediately and the bot stays
+    # responsive to all other buttons (cancel, settings, download, ...).
+    asyncio.create_task(
+        _run_registration_task(
+            context=context,
+            chat_id=chat_id,
+            state=state,
+            settings_snapshot=settings_snapshot,
+            proxy_path=proxy_path,
+            pre_invites=pre_invites,
+            cancel_event=cancel_event,
+        )
+    )
+
+
+async def _run_registration_task(
+    *, context, chat_id, state, settings_snapshot, proxy_path, pre_invites, cancel_event,
+):
+    """Background task: runs registration in executor, edits progress, sends CSV."""
     loop = asyncio.get_running_loop()
     accounts_lock = threading.Lock()
+    started_count = len(state["accounts"])
 
     def on_account(row: dict):
         with accounts_lock:
             state["accounts"].append(row)
 
-    settings_snapshot = dict(s)
-    proxy_path = state["proxy_path"]
-    pre_invites = [r.get("user_code", "") for r in state["accounts"] if r.get("user_code")]
-
-    # Run blocking pipeline in thread
     fut = loop.run_in_executor(
         None,
         lambda: run_registration(
@@ -430,8 +458,6 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ),
     )
 
-    # Progress updater
-    started_count = len([r for r in state["accounts"]])  # base reference
     last_text = None
     while not fut.done():
         await asyncio.sleep(2.5)
@@ -439,9 +465,11 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
             done = len(state["accounts"]) - started_count
         text = (
             f"🚀 *Registrasi berjalan*\n"
-            f"Target: `{settings_snapshot['count']}`  Threads: `{settings_snapshot['threads']}`\n"
-            f"Berhasil sejauh ini: `{done}/{settings_snapshot['count']}`\n"
-            f"Total akun di memori: `{len(state['accounts'])}`"
+            f"Target: `{settings_snapshot['count']}`  "
+            f"Threads: `{settings_snapshot['threads']}`\n"
+            f"Berhasil sesi ini: `{done}/{settings_snapshot['count']}`\n"
+            f"Total akun di memori: `{len(state['accounts'])}`\n\n"
+            f"_Anda tetap bisa pakai menu lain selama proses berjalan._"
         )
         if cancel_event.is_set():
             text += "\n\n⛔ _Cancel diminta — menunggu worker selesai..._"
@@ -460,7 +488,6 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     result = await fut
 
-    # Selesai (or cancelled)
     state["is_running"] = False
     state["cancel_event"] = None
 
@@ -486,7 +513,6 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         await context.bot.send_message(chat_id, summary, parse_mode="Markdown")
 
-    # Auto-kirim CSV jika ada akun
     if state["accounts"]:
         csv_bytes = rows_to_csv_bytes(state["accounts"])
         bio = io.BytesIO(csv_bytes)
@@ -511,7 +537,12 @@ async def start_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # Application factory
 # ---------------------------------------------------------------------------
 def build_application(token: str) -> Application:
-    application = Application.builder().token(token).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .concurrent_updates(True)
+        .build()
+    )
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("menu", cmd_menu))
     application.add_handler(CommandHandler("help", cmd_help))
