@@ -1,9 +1,6 @@
 import os
 import threading
-import asyncio
 from flask import Flask
-
-from bot import main
 
 app = Flask(__name__)
 
@@ -11,13 +8,14 @@ app = Flask(__name__)
 def home():
     return "NovaEX Bot Running"
 
-def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    main()
-
-threading.Thread(target=run_bot).start()
-
-if __name__ == "__main__":
+def run_web():
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+
+# Flask jalan di background
+threading.Thread(target=run_web, daemon=True).start()
+
+# Telegram bot jalan di main thread
+from bot import main
+
+main()
