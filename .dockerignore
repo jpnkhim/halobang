@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env
+__pycache__
+*.pyc
+*.csv
+proxies_*.txt
+README.md
+novaku_original.py
