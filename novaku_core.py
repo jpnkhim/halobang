@@ -25,7 +25,6 @@ import threading
 import time
 import urllib.parse
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pyotp
 import requests
@@ -717,24 +716,40 @@ def run_registration(settings: dict, proxy_file: str,
     pool.release(boot_proxy)
 
     success = 0
+    success_lock = threading.Lock()
     count = settings["count"]
     threads = max(1, min(settings["threads"], MAX_THREADS))
 
-    with ThreadPoolExecutor(max_workers=threads) as pool_ex:
-        futures = [
-            pool_ex.submit(
-                worker_task, i, count, settings, fake, pool,
-                invite_pool, mail_domain, server_pub_initial,
-                on_account, cancel_event,
-            )
-            for i in range(1, count + 1)
-        ]
-        for fut in as_completed(futures):
+    work_queue: "queue.Queue[int]" = queue.Queue()
+    for i in range(1, count + 1):
+        work_queue.put(i)
+
+    def worker_loop():
+        nonlocal success
+        while True:
+            if cancel_event.is_set():
+                return
             try:
-                if fut.result():
-                    success += 1
+                idx = work_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                ok = worker_task(
+                    idx, count, settings, fake, pool, invite_pool,
+                    mail_domain, server_pub_initial, on_account, cancel_event,
+                )
             except Exception as e:
                 log.warning(f"worker raised: {e}")
+                ok = False
+            if ok:
+                with success_lock:
+                    success += 1
+
+    workers = [threading.Thread(target=worker_loop, daemon=True) for _ in range(threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
 
     return {
         "success": success,
